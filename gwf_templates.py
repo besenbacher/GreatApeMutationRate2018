@@ -37,6 +37,13 @@ samtools_index_filtered_bam = \
 samtools index filtered_bam_files/{individual}.bam
 '''
 
+samtools_index_bamout = \
+    template(input='bamout_files/{individual}/{chrom}.{start}.{end}.bam',
+            output='bamout_files/{individual}/{chrom}.{start}.{end}.bam.bai',
+            cores=1, account='MutationRates', walltime='0:59:00',memory='1g') << '''
+samtools index bamout_files/{individual}/{chrom}.{start}.{end}.bam
+'''
+
 collect_realign_regions = \
   template(input=['ref-genomes/{refGenome}.fa', 'ref-genomes/{refGenome}.dict',
                   'merged_bam_files/{individual}.bam', 'merged_bam_files/{individual}.bam.bai'],
@@ -186,7 +193,7 @@ samtools index bamout_files/{individual}/{chrom}.{start}.{end}.bam
 '''
 
 
-#inkluderer info om hvorvidt basen er repeat_masket
+#get count of coverage combinations in a trio stratified by 3bp-context and repeat status
 get_family_coverage_context_wr = \
   template(input=['filtered_bam_files/{father}.bam','filtered_bam_files/{father}.bam.bai',
                   'filtered_bam_files/{mother}.bam','filtered_bam_files/{mother}.bam.bai',
@@ -213,3 +220,140 @@ def combine_coverage_context_wr(**arguments):
     extra_options = {'input':input_files}
     (options, spec) = _combine_coverage_context_wr(**arguments)
     return (add_options(options, extra_options), spec)
+
+
+run_poo_region = \
+    template(input=['new_vcf_files/{specie}/haplocaller.raw.{chrom}.{start}.{end}.vcf',
+                    'bamout_files/{child}/{chrom}.{start}.{end}.bam',
+                    'bamout_files/{child}/{chrom}.{start}.{end}.bam.bai'],
+             output=['poo_data/{child}/{chrom}.{start}.{end}.txt'],
+             walltime='10:00:00', account='DanishPanGenome',memory='1g') << '''
+mkdir -p poo_data/{child}/
+python python_scripts/vcf_parent_of_origin_py3.py new_vcf_files/{specie}/haplocaller.raw.{chrom}.{start}.{end}.vcf {father} {mother} {child} bamout_files/{child}/{chrom}.{start}.{end}.bam > poo_data/{child}/{chrom}.{start}.{end}.txt
+'''
+
+_combine_poo = \
+  template(output=['poo_data/{child}_{outname}.txt'],
+          memory='8g',
+          account='DanishPanGenome',
+          walltime='10:00:00') << \
+'''
+cat {input_list} | sort -k1,1 > poo_data/{child}_{outname}.txt
+'''
+
+def combine_poo_region(**arguments):
+    regions = arguments['regions']
+    input_files = ['poo_data/{child}/'.format(**arguments) + '{}.{}.{}.txt'.format(chrom,start,end) for chrom,start,end in regions]
+    arguments['input_list'] = ' '.join(input_files)
+    extra_options = {'input':input_files}
+    (options, spec) = _combine_poo(**arguments)
+    return (add_options(options, extra_options), spec)
+
+
+
+vcf2denovo_dat_child = \
+    template(input=["new_vcf_files/{specie}.haplocaller.raw.auto.vcf",
+                    "family_description/{specie}.txt",
+                    "poo_data/{child}_autosomes.txt"],
+             output=["dat_files/gatk/{specie}/denovo_raw_{vtype}_{child}.dat",
+                     "dat_files/gatk/{specie}/het_test_{vtype}_{child}.dat",
+                     "dat_files/gatk/{specie}/homoref_test_{vtype}_{child}.dat"],
+                 walltime='11:59:00', memory='2g',account='MutationRates') << \
+'''
+mkdir -p dat_files/gatk/{specie}/
+cat new_vcf_files/{specie}.haplocaller.raw.auto.vcf | python python_scripts/get_denovo_single.py family_description/{specie}.txt dat_files/gatk/{specie}/ {refname} {child} --var_type {vtype} --postfix {vtype}_{child} --PoO_data poo_data/{child}_autosomes.txt
+'''
+
+
+_make_known = \
+    template(input=[],
+            output=['tmp/{specie}_known.txt'],
+            walltime='10:00:00', memory='4g', account='DanishPanGenome') << '''
+
+cat {known_files} | awk '$1!~/#/{{print $1"_"$2"_"$5,"TRUE"}}' | sort -u -k1,1 > tmp/{specie}_known.txt
+'''
+
+add_known = template(input=['dat_files/{caller}/{specie}/denovo_raw_SNV_{child}_w_DPS20.dat',
+                             'tmp/{specie}_known.txt'],
+                      output=['dat_files/{caller}/{specie}/denovo_raw_SNV_{child}_w_DPS20_w_known.dat'],
+                      walltime='10:00:00', memory='4g', account='DanishPanGenome') << '''
+n=$(head -1 dat_files/{caller}/{specie}/denovo_raw_SNV_{child}_w_DPS20.dat | awk '{{print NF}}')
+cat dat_files/{caller}/{specie}/denovo_raw_SNV_{child}_w_DPS20.dat | awk '{{print $1"_"$2"_"$4,$0}}' | sort -k1,1 | join -a1 - tmp/{specie}_known.txt | cut -d" " -f2- | awk '{{if (NF=='$n') {{if ($1=="CHROM") print $0,"known_variant"; else print $0,"FALSE"}} else print $0}}' | sort -gk2 > dat_files/{caller}/{specie}/denovo_raw_SNV_{child}_w_DPS20_w_known.dat
+'''
+
+def make_known(**arguments):
+    extra_options = {'input':arguments["known"]}
+    arguments["known_files"] = ' '.join(arguments["known"])
+    (options, spec) = _make_known(**arguments)
+    return (add_options(options, extra_options), spec)
+
+
+get_sam_depth_variants = \
+  template(input = \
+           ['dat_files/{caller}/{specie}/denovo_raw_{vtype}_{child}.dat',
+            'dat_files/{caller}/{specie}/het_test_{vtype}_{child}.dat',
+            'dat_files/{caller}/{specie}/homoref_test_{vtype}_{child}.dat',
+            'filtered_bam_files/{father}.bam',
+            'filtered_bam_files/{mother}.bam',
+            'filtered_bam_files/{child}.bam'],
+           output = \
+            ["sam_depth/{specie}/depth_Q{minQ}_q{minq}_denovo_raw_{vtype}.{child}.txt",
+             "sam_depth/{specie}/depth_Q{minQ}_q{minq}_het_test_{vtype}.{child}.txt",
+             "sam_depth/{specie}/depth_Q{minQ}_q{minq}_homoref_test_{vtype}.{child}.txt"],
+           account="MutationRates", walltime="110:00:00",memory="12g") << \
+'''
+mkdir -p sam_depth/{specie}
+samtools depth -b <(cat dat_files/{caller}/{specie}/denovo_raw_{vtype}_{child}.dat | awk '$5=="{child}" {{print $1,$2-1,$2}}' | gsort -k1,1 -k2,2n) -Q{minQ} -q{minq} filtered_bam_files/{child}.bam filtered_bam_files/{father}.bam filtered_bam_files/{mother}.bam | awk '{{print $1"_"$2"_{child}",$3,$4,$5}}' | sort -k1,1 > sam_depth/{specie}/depth_Q{minQ}_q{minq}_denovo_raw_{vtype}.{child}.txt
+samtools depth -b <(cat dat_files/{caller}/{specie}/homoref_test_{vtype}_{child}.dat | awk '$5=="{child}" {{print $1,$2-1,$2}}' | gsort -k1,1 -k2,2n) -Q{minQ} -q{minq} filtered_bam_files/{child}.bam filtered_bam_files/{father}.bam filtered_bam_files/{mother}.bam | awk '{{print $1"_"$2"_{child}",$3,$4,$5}}' | sort -k1,1 > sam_depth/{specie}/depth_Q{minQ}_q{minq}_homoref_test_{vtype}.{child}.txt
+samtools depth -b <(cat dat_files/{caller}/{specie}/het_test_{vtype}_{child}.dat | awk '$5=="{child}" {{print $1,$2-1,$2}}' | gsort -k1,1 -k2,2n) -Q{minQ} -q{minq} filtered_bam_files/{child}.bam filtered_bam_files/{father}.bam filtered_bam_files/{mother}.bam | awk '{{print $1"_"$2"_{child}",$3,$4,$5}}' | sort -k1,1 > sam_depth/{specie}/depth_Q{minQ}_q{minq}_het_test_{vtype}.{child}.txt
+'''
+
+merge_and_join = \
+    template(
+        input=['dat_files/{caller}/{specie}/{ftype}_{child}{extra}.dat',
+               'sam_depth/{specie}/depth_Q{minQ}_q{minq}_{ftype}.{child}.txt'],
+        output=['dat_files/{caller}/{specie}/{ftype}_{child}{extra}_w_DPS{minQ}.dat'],
+        memory='32g', account='MutationRates', walltime='11:00:00') << \
+'''
+head -1 dat_files/{caller}/{specie}/{ftype}_{child}{extra}.dat | awk -v OFS="\t" '{{print $0,"CHILD.DPS{minQ}","FATHER.DPS{minQ}","MOTHER.DPS{minQ}"}}' > dat_files/{caller}/{specie}/{ftype}_{child}{extra}_w_DPS{minQ}.dat
+cat dat_files/{caller}/{specie}/{ftype}_{child}{extra}.dat | awk '$1!="CHROM"{{print $1"_"$2"_"$5, $0}}' | sort -k1,1 | join - <(sort -k1,1 sam_depth/{specie}/depth_Q{minQ}_q{minq}_{ftype}.{child}.txt) | sed 'y/ /\t/' | cut -f2- >>  dat_files/{caller}/{specie}/{ftype}_{child}{extra}_w_DPS{minQ}.dat
+'''
+
+addAD2_lowMQ = \
+    template(
+        input=['dat_files/{caller}/{specie}/{ftype}_{child}{extra}.dat'],
+        output=['dat_files/{caller}/{specie}/{ftype}_{child}{extra}_w_lowMQ.dat'],
+        memory='4g', account='MutationRates', walltime='24:00:00') << \
+'''
+cat dat_files/{caller}/{specie}/{ftype}_{child}{extra}.dat | python python_scripts/add_AD2_lowQ_py3.py new_gatk_files/{child}.recalibrated.bam new_gatk_files/{father}.recalibrated.bam new_gatk_files/{mother}.recalibrated.bam > dat_files/{caller}/{specie}/{ftype}_{child}{extra}_w_lowMQ.dat
+'''
+
+add_parents_cov = \
+    template(
+        input=['dat_files/{caller}/{specie}/{ftype}_{child}{extra}.dat'],
+        output=['dat_files/{caller}/{specie}/{ftype}_{child}{extra}_w_pc.dat'],
+        memory='4g', account='MutationRates', walltime='24:00:00') << \
+'''
+cat dat_files/{caller}/{specie}/{ftype}_{child}{extra}.dat | python python_scripts/add_individual_coverage.py > dat_files/{caller}/{specie}/{ftype}_{child}{extra}_w_pc.dat
+'''
+
+add_repeat = \
+    template(
+        input=['dat_files/{caller}/{specie}/{ftype}_{child}{extra}.dat'],
+        output=['dat_files/{caller}/{specie}/{ftype}_{child}{extra}_w_repeat.dat'],
+        memory='4g', account='MutationRates', walltime='24:00:00') << \
+'''
+cat dat_files/{caller}/{specie}/{ftype}_{child}{extra}.dat | python python_scripts/add_repeat_status.py ~/Data/2bit/{refgenome}.2bit > dat_files/{caller}/{specie}/{ftype}_{child}{extra}_w_repeat.dat
+'''
+
+add_segdup = \
+    template(
+	input=['dat_files/{caller}/{specie}/{ftype}_{child}{extra}.dat'],
+    output=['dat_files/{caller}/{specie}/{ftype}_{child}{extra}_w_sd.dat'],
+    memory='4g', account='MutationRates', walltime='24:00:00') << \
+'''
+cat dat_files/{caller}/{specie}/{ftype}_{child}{extra}.dat | head -1 | awk -vOFS="\t" '{{print $0,"SD"}}' > dat_files/{caller}/{specie}/\
+{ftype}_{child}{extra}_w_sd.dat
+cat dat_files/{caller}/{specie}/{ftype}_{child}{extra}.dat | awk '$1!="CHROM"' | gsort -k1,1 -k2,2n | ~/Scripts/bed_filter_pos.py segdup/{refgenome}_combined.bed >> dat_files/{caller}/{specie}/{ftype}_{child}{extra}_w_sd.dat
+'''
+
